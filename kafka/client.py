@@ -170,6 +170,9 @@ class KafkaClient(object):
             "Request for %s failed with errorcode=%d" %
             (TopicAndPartition(resp.topic, resp.partition), resp.error))
 
+    def __repr__(self):
+        return '<KafkaClient client_id=%s>' % (self.client_id)
+
     #################
     #   Public API  #
     #################

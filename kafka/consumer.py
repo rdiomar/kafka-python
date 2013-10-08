@@ -254,6 +254,10 @@ class SimpleConsumer(Consumer):
         self.iter_timeout = iter_timeout
         self.queue = Queue()
 
+    def __repr__(self):
+        return '<SimpleConsumer group=%s, topic=%s, partitions=%s>' % \
+            (self.group, self.topic, str(self.offsets.keys()))
+
     def provide_partition_info(self):
         """
         Indicates that partition info must be returned by the consumer
@@ -566,6 +570,62 @@ class MultiProcessConsumer(Consumer):
             proc.daemon = True
             proc.start()
             self.procs.append(proc)
+
+    def __repr__(self):
+        return '<MultiProcessConsumer group=%s, topic=%s, consumers=%d>' % \
+            (self.group, self.topic, len(self.procs))
+
+    def _consume(self, partitions):
+        """
+        A child process worker which consumes messages based on the
+        notifications given by the controller process
+        """
+
+        # Make the child processes open separate socket connections
+        self.client.reinit()
+
+        # We will start consumers without auto-commit. Auto-commit will be
+        # done by the master controller process.
+        consumer = SimpleConsumer(self.client, self.group, self.topic,
+                                  partitions=partitions,
+                                  auto_commit=False,
+                                  auto_commit_every_n=None,
+                                  auto_commit_every_t=None)
+
+        # Ensure that the consumer provides the partition information
+        consumer.provide_partition_info()
+
+        while True:
+            # Wait till the controller indicates us to start consumption
+            self.start.wait()
+
+            # If we are asked to quit, do so
+            if self.exit.is_set():
+                break
+
+            # Consume messages and add them to the queue. If the controller
+            # indicates a specific number of messages, follow that advice
+            count = 0
+
+            for partition, message in consumer:
+                self.queue.put((partition, message))
+                count += 1
+
+                # We have reached the required size. The controller might have
+                # more than what he needs. Wait for a while.
+                # Without this logic, it is possible that we run into a big
+                # loop consuming all available messages before the controller
+                # can reset the 'start' event
+                if count == self.size.value:
+                    self.pause.wait()
+                    break
+
+            # In case we did not receive any message, give up the CPU for
+            # a while before we try again
+            if count == 0:
+                time.sleep(0.1)
+
+        consumer.stop()
 
     def stop(self):
         # Set exit and start off all waiting consumers
