@@ -207,6 +207,9 @@ class SimpleProducer(Producer):
     def __repr__(self):
         return '<SimpleProducer batch=%s>' % self.async
 
+    def __repr__(self):
+        return '<SimpleProducer topic=%s, batch=%s>' % (self.topic, self.async)
+
 
 class KeyedProducer(Producer):
     """
