@@ -451,7 +451,6 @@ class KafkaProtocol(object):
         data: bytes to decode
         """
         ((correlation_id,), cur) = relative_unpack('>i', data, 0)
-        (client_id, cur) = read_short_string(data, cur)
         ((num_topics,), cur) = relative_unpack('>i', data, cur)
 
         for i in xrange(num_topics):
@@ -502,7 +501,6 @@ class KafkaProtocol(object):
         """
 
         ((correlation_id,), cur) = relative_unpack('>i', data, 0)
-        (client_id, cur) = read_short_string(data, cur)
         ((num_topics,), cur) = relative_unpack('>i', data, cur)
 
         for i in range(num_topics):
