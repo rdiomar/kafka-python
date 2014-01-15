@@ -297,8 +297,7 @@ class SimpleConsumer(Consumer):
                  iter_timeout=None, zk_hosts=None, zk_chroot='/'):
 
         super(SimpleConsumer, self).__init__(
-            client, group, topic,
-            partitions=partitions,
+            client, group, topic, partitions=partitions,
             auto_commit=auto_commit,
             auto_commit_every_n=auto_commit_every_n,
             auto_commit_every_t=auto_commit_every_t,
