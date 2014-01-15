@@ -1,11 +1,13 @@
 from __future__ import absolute_import
 
 from itertools import izip_longest, repeat
+from kazoo.client import KazooClient
 import logging
+from multiprocessing import Process, Queue as MPQueue, Event, Value
+import os
+from Queue import Empty, Queue
 import time
 from threading import Lock
-from multiprocessing import Process, Queue as MPQueue, Event, Value
-from Queue import Empty, Queue
 
 from kafka.common import (
     ErrorMapping, FetchRequest,
@@ -29,6 +31,8 @@ MAX_FETCH_BUFFER_SIZE_BYTES = FETCH_BUFFER_SIZE_BYTES * 8
 ITER_TIMEOUT_SECONDS = 60
 NO_MESSAGES_WAIT_TIME_SECONDS = 0.1
 
+CONSUMERS_DIR = "consumers"
+OFFSETS_DIR = "offsets"
 
 class FetchContext(object):
     """
@@ -70,7 +74,8 @@ class Consumer(object):
     """
     def __init__(self, client, group, topic, partitions=None, auto_commit=True,
                  auto_commit_every_n=AUTO_COMMIT_MSG_COUNT,
-                 auto_commit_every_t=AUTO_COMMIT_INTERVAL):
+                 auto_commit_every_t=AUTO_COMMIT_INTERVAL,
+                 zk_hosts=None, zk_chroot='/'):
 
         self.client = client
         self.topic = topic
@@ -88,6 +93,31 @@ class Consumer(object):
         self.auto_commit = auto_commit
         self.auto_commit_every_n = auto_commit_every_n
         self.auto_commit_every_t = auto_commit_every_t
+        self.partitions_to_commit = set()
+
+        for partition in partitions:
+            self.offsets[partition] = 0
+
+        # Zookeeper
+        self._init_zk(zk_hosts, zk_chroot)
+
+        # Uncomment for 0.8.1
+        # def get_or_init_offset_callback(resp):
+        #     if resp.error == ErrorMapping.NO_ERROR:
+        #         return resp.offset
+        #     elif resp.error == ErrorMapping.UNKNOWN_TOPIC_OR_PARTITON:
+        #         return 0
+        #     else:
+        #         raise Exception("OffsetFetchRequest for topic=%s, "
+        #                         "partition=%d failed with errorcode=%s" % (
+        #                             resp.topic, resp.partition, resp.error))
+        #
+        # for partition in partitions:
+        #     req = OffsetFetchRequest(topic, partition)
+        #     (offset,) = self.client.send_offset_fetch_request(group, [req],
+        #                   callback=get_or_init_offset_callback,
+        #                   fail_on_error=False)
+        #     self.offsets[partition] = offset
 
         # Set up the auto-commit timer
         if auto_commit is True and auto_commit_every_t is not None:
@@ -95,27 +125,48 @@ class Consumer(object):
                                                self.commit)
             self.commit_timer.start()
 
-        def get_or_init_offset_callback(resp):
-            if resp.error == ErrorMapping.NO_ERROR:
-                return resp.offset
-            elif resp.error == ErrorMapping.UNKNOWN_TOPIC_OR_PARTITON:
-                return 0
-            else:
-                raise Exception("OffsetFetchRequest for topic=%s, "
-                                "partition=%d failed with errorcode=%s" % (
-                                    resp.topic, resp.partition, resp.error))
+    def _get_offsets_dir(self):
+        return os.path.join(self.zk_chroot, CONSUMERS_DIR, self.group,
+                            OFFSETS_DIR, self.topic)
+    def _init_zk(self, zk_hosts, zk_chroot):
+        if zk_hosts:
+            self.zk = KazooClient(",".join(zk_hosts))
+            self.zk.start()
+            self.zk_chroot = zk_chroot
+            self.offset_path = self._get_offsets_dir()
+            self.zk_offset_counters = {}
+            self._fetch_offsets()
+        else:
+            self.zk = None
+            self.zk_chroot = None
+            self.offset_path = None
+            self.zk_offset_counters = None
 
-        # Uncomment for 0.8.1
-        #
-        #for partition in partitions:
-        #    req = OffsetFetchRequest(topic, partition)
-        #    (offset,) = self.client.send_offset_fetch_request(group, [req],
-        #                  callback=get_or_init_offset_callback,
-        #                  fail_on_error=False)
-        #    self.offsets[partition] = offset
+    def _get_partition_offsets(self, partitions, offset_time):
+        reqs = []
+        for partition in partitions:
+            reqs.append(OffsetRequest(self.topic, partition, offset_time, 1))
+        return self.client.send_offset_request(reqs)
+
+    def _fetch_offsets(self, partitions=None):
+        if self.zk is None:
+            raise Exception("Cannot fetch offsets without zookeeper")
+
+        if partitions is None:
+            partitions = self.offsets.keys()
+        start_offsets = {}
+        for resp in self._get_partition_offsets(partitions, -2):
+            start_offsets[resp.partition] = resp.offsets[0]
+
+        self.zk_offset_counters = {}
 
         for partition in partitions:
-            self.offsets[partition] = 0
+            partition_offset_path = os.path.join(self.offset_path,
+                                                 str(partition))
+            counter = self.zk.Counter(partition_offset_path,
+                                      default=start_offsets[partition])
+            self.zk_offset_counters[partition] = counter
+            self.offsets[partition] = counter.value
 
     def commit(self, partitions=None):
         """
@@ -124,36 +175,42 @@ class Consumer(object):
         partitions: list of partitions to commit, default is to commit
                     all of them
         """
+        if self.zk is None:
+            raise Exception("Cannot commit offsets without zookeeper")
 
-        # short circuit if nothing happened. This check is kept outside
-        # to prevent un-necessarily acquiring a lock for checking the state
-        if self.count_since_commit == 0:
-            return
+        if partitions is None:
+            partitions = self.offsets.keys()
 
         with self.commit_lock:
-            # Do this check again, just in case the state has changed
-            # during the lock acquiring timeout
-            if self.count_since_commit == 0:
-                return
-
-            reqs = []
-            if not partitions:  # commit all partitions
-                partitions = self.offsets.keys()
-
             for partition in partitions:
                 offset = self.offsets[partition]
-                log.debug("Commit offset %d in SimpleConsumer: "
-                          "group=%s, topic=%s, partition=%s" %
-                          (offset, self.group, self.topic, partition))
+                counter = self.zk_offset_counters[partition]
+                if counter.value == offset:
+                    # Nothing changed for this partition
+                    continue
+                log.debug("Commit offset %d for consumer group=%s, topic=%s, "
+                          "partition=%s", offset, self.group, self.topic,
+                          partition)
+                counter += offset - counter.value
+                self.zk.sync(counter.path)
 
-                reqs.append(OffsetCommitRequest(self.topic, partition,
-                                                offset, None))
-
-            resps = self.client.send_offset_commit_request(self.group, reqs)
-            for resp in resps:
-                assert resp.error == 0
-
-            self.count_since_commit = 0
+        # Do this instead for kafka 0.8.1
+        # reqs = []
+        # if not partitions:  # demmit all partitions
+        #     partitions = self.offsets.keys()
+        #
+        # for partition in partitions:
+        #     offset = self.offsets[partition]
+        #     log.debug("Commit offset %d in SimpleConsumer: "
+        #               "group=%s, topic=%s, partition=%s" %
+        #               (offset, self.group, self.topic, partition))
+        #
+        #     reqs.append(OffsetCommitRequest(self.topic, partition,
+        #                                     offset, None))
+        #
+        # resps = self.client.send_offset_commit_request(self.group, reqs)
+        # for resp in resps:
+        #     assert resp.error == 0
 
     def _auto_commit(self):
         """
@@ -161,13 +218,17 @@ class Consumer(object):
         """
 
         # Check if we are supposed to do an auto-commit
-        if not self.auto_commit or self.auto_commit_every_n is None:
+        if (self.zk is None or not self.auto_commit or
+                self.auto_commit_every_n is None):
             return
 
-        if self.count_since_commit > self.auto_commit_every_n:
+        if self.count_since_commit >= self.auto_commit_every_n:
             self.commit()
+            self.count_since_commit = 0
 
     def stop(self):
+        if self.zk:
+            self.zk.stop()
         if self.commit_timer is not None:
             self.commit_timer.stop()
             self.commit()
@@ -233,13 +294,13 @@ class SimpleConsumer(Consumer):
                  fetch_size_bytes=FETCH_MIN_BYTES,
                  buffer_size=FETCH_BUFFER_SIZE_BYTES,
                  max_buffer_size=MAX_FETCH_BUFFER_SIZE_BYTES,
-                 iter_timeout=None):
+                 iter_timeout=None, zk_hosts=None, zk_chroot='/'):
         super(SimpleConsumer, self).__init__(
-            client, group, topic,
-            partitions=partitions,
+            client, group, topic, partitions=partitions,
             auto_commit=auto_commit,
             auto_commit_every_n=auto_commit_every_n,
-            auto_commit_every_t=auto_commit_every_t)
+            auto_commit_every_t=auto_commit_every_t,
+            zk_hosts=zk_hosts, zk_chroot=zk_chroot)
 
         if max_buffer_size is not None and buffer_size > max_buffer_size:
             raise ValueError("buffer_size (%d) is greater than "
@@ -274,7 +335,7 @@ class SimpleConsumer(Consumer):
                 1 is relative to the current offset
                 2 is relative to the latest known offset (tail)
         """
-
+        partitions = self.offsets.keys()
         if whence == 1:  # relative to current position
             for partition, _offset in self.offsets.items():
                 self.offsets[partition] = _offset + offset
@@ -283,20 +344,15 @@ class SimpleConsumer(Consumer):
             # distribute the remained evenly
             (delta, rem) = divmod(offset, len(self.offsets))
             deltas = {}
-            for partition, r in izip_longest(self.offsets.keys(),
+            for partition, r in izip_longest(partitions,
                                              repeat(1, rem), fillvalue=0):
                 deltas[partition] = delta + r
 
-            reqs = []
-            for partition in self.offsets.keys():
-                if whence == 0:
-                    reqs.append(OffsetRequest(self.topic, partition, -2, 1))
-                elif whence == 2:
-                    reqs.append(OffsetRequest(self.topic, partition, -1, 1))
-                else:
-                    pass
+            if whence == 0:
+                resps = self._get_partition_offsets(partitions, -2)
+            else:
+                resps = self._get_partition_offsets(partitions, -1)
 
-            resps = self.client.send_offset_request(reqs)
             for resp in resps:
                 self.offsets[resp.partition] = \
                     resp.offsets[0] + deltas[resp.partition]

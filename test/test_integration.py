@@ -587,7 +587,13 @@ class TestConsumer(KafkaTestCase):
         cls.server2.close()
         cls.zk.close()
 
+    def setUp(self):
+        super(TestConsumer, self).setUp()
+        self.zk_chroot = self.id()[self.id().rindex(".")+1:]
+
     def test_simple_consumer(self):
+        group = "group1"
+
         # Produce 100 messages to partition 0
         produce1 = ProduceRequest(self.topic, 0, messages=[
             create_message("Test message 0 %d" % i) for i in range(100)
@@ -607,9 +613,11 @@ class TestConsumer(KafkaTestCase):
             self.assertEquals(resp.offset, 0)
 
         # Start a consumer
-        consumer = SimpleConsumer(self.client, "group1",
-                                  self.topic, auto_commit=False,
-                                  iter_timeout=0)
+        zk_server = "%s:%d" % (self.zk.host, self.zk.port)
+        consumer = SimpleConsumer(self.client, group, self.topic,
+                                  auto_commit=False, iter_timeout=0,
+                                  zk_hosts=[zk_server],
+                                  zk_chroot=self.zk_chroot)
         all_messages = []
         for message in consumer:
             all_messages.append(message)
@@ -631,7 +639,27 @@ class TestConsumer(KafkaTestCase):
             all_messages.append(message)
 
         self.assertEquals(len(all_messages), 13)
+        self.assertEqual(consumer.offsets, {0: 100, 1: 100})
+        consumer.commit()
+        consumer.stop()
 
+        # Start another consumer with the same group and check the offsets
+        consumer = SimpleConsumer(self.client, group, self.topic,
+                                  auto_commit=False, iter_timeout=0,
+                                  zk_hosts=[zk_server],
+                                  zk_chroot=self.zk_chroot)
+        self.assertEqual(consumer.offsets, {0: 100, 1: 100})
+        consumer.seek(-10, 1)
+        # Commit offset for a single partition
+        consumer.commit([1])
+        consumer.stop()
+        # Start another consumer with the same group and check the offsets
+        consumer = SimpleConsumer(self.client, group, self.topic,
+                                  auto_commit=False, iter_timeout=0,
+                                  zk_hosts=[zk_server],
+                                  zk_chroot=self.zk_chroot)
+
+        self.assertEqual(consumer.offsets, {0: 100, 1:90})
         consumer.stop()
 
     def test_simple_consumer_blocking(self):
@@ -746,7 +774,7 @@ class TestConsumer(KafkaTestCase):
         messages = consumer.get_messages(count=10, block=True, timeout=5)
         self.assertEqual(len(messages), 5)
         diff = (datetime.now() - start).total_seconds()
-        self.assertGreaterEqual(diff, 5)
+        self.assertGreaterEqual(diff, 4.9)
 
         consumer.stop()
 
