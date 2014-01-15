@@ -295,6 +295,7 @@ class SimpleConsumer(Consumer):
                  buffer_size=FETCH_BUFFER_SIZE_BYTES,
                  max_buffer_size=MAX_FETCH_BUFFER_SIZE_BYTES,
                  iter_timeout=None, zk_hosts=None, zk_chroot='/'):
+
         super(SimpleConsumer, self).__init__(
             client, group, topic,
             partitions=partitions,
